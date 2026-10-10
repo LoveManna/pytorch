@@ -63,6 +63,15 @@ _AUTOCAST_TAG = "# torch.compiler.export_python autocast: "
 # deterministic algorithms were on when inductor chose between a deterministic and an
 # atomic lowering.
 _GLOBAL_STATE_TAG = "# torch.compiler.export_python global-state: "
+# The CPU vector ISA the artifact's C++ kernels were generated against. Inductor bakes
+# the host's vector width into a C++ loop's stride -- a reduction emitted on AVX-512
+# steps and stores 16 floats at a time -- while the ISA itself is re-picked when the
+# artifact is compiled on whichever machine loads it. Replay under a narrower vector unit
+# and each store covers half of its own step, leaving the rest of the output as whatever
+# the allocator held: no error, no warning, and a result that is not close to anything.
+# Unlike the CUDA case there is no kernel-image error to fall back on, and no other stamp
+# covers it, so this one raises rather than warns.
+_CPU_ISA_TAG = "# torch.compiler.export_python cpu-vec-isa: "
 
 # os.link failures that mean the filesystem cannot do hard links at all, as opposed to
 # a real I/O problem (a full disk, a bad permission) that must not be swallowed. EINVAL
@@ -406,6 +415,20 @@ def _autocast_state(
     ]
 
 
+def _cpu_vec_isa(code: str) -> str | None:
+    """The CPU vector ISA a C++ kernel in ``code`` was generated against, or None.
+
+    None for an artifact with no C++ kernel, where the question does not arise -- a CUDA
+    artifact must not start refusing to run because it moved between two hosts whose CPUs
+    differ in a way it never depended on.
+    """
+    if "async_compile.cpp_pybinding(" not in code:
+        return None
+    from torch._inductor.cpu_vec_isa import pick_vec_isa
+
+    return str(pick_vec_isa())
+
+
 def _global_state() -> list[list[str]]:
     """Ambient globals the emitted code resolves against, as [key, value] pairs.
 
@@ -538,7 +561,8 @@ class ExportedPythonArtifact:
             f"{_INPUT_DUPLICATE_TAG}{_input_duplicates(example, example_tensors)!r}\n"
             f"{_AUTOCAST_TAG}"
             f"{_autocast_state(example, example_tensors, _code_devices(code))!r}\n"
-            f"{_GLOBAL_STATE_TAG}{_global_state()!r}\n{code}"
+            f"{_GLOBAL_STATE_TAG}{_global_state()!r}\n"
+            f"{_CPU_ISA_TAG}{_cpu_vec_isa(code)!r}\n{code}"
         )
         # os.link does not follow a symlink at its destination, so resolve one first: a
         # dangling symlink at path would otherwise read as a lost race forever.
@@ -695,6 +719,37 @@ class ExportedPythonArtifact:
                     "same autocast context you call it in."
                 )
 
+    def _check_cpu_isa(self, code: str) -> None:
+        # Checked once, before _load compiles the C++ kernel: the ISA that kernel is
+        # built under is pick_vec_isa() at that moment, and later calls cannot change it.
+        captured = self._read_stamp(code, _CPU_ISA_TAG)
+        if captured is None:
+            # A recorded None (no C++ kernel) is a stamp; a dropped or unparsable line
+            # is not.
+            if self._read_raw_stamp(code, _CPU_ISA_TAG) != "None":
+                log.warning(
+                    "torch.compiler.export_python: the artifact at %s carries no "
+                    "recorded cpu-vec-isa stamp, so running a C++ kernel built for a "
+                    "different vector width than this host's is unchecked, and that "
+                    "failure is silent. Delete %s to regenerate it.",
+                    self._path,
+                    self._path,
+                )
+            return
+        from torch._inductor.cpu_vec_isa import pick_vec_isa
+
+        live_isa = str(pick_vec_isa())
+        if live_isa != captured:
+            raise _precompile_error(
+                "torch.compiler.export_python: this machine's CPU vector ISA is "
+                f"{live_isa!r} but the artifact's C++ kernels were generated for "
+                f"{captured!r}. The vector width is baked into their loop strides "
+                "while the ISA is re-picked at compile time, so running them here "
+                "would write past the end of an output or leave part of it "
+                f"uninitialized. Delete {self._path} to regenerate on this machine, "
+                "or run where the captured ISA is available."
+            )
+
     def _check_module_training(self, args: tuple[Any, ...]) -> None:
         actual = _module_training_state(args)
         if not actual:
@@ -831,6 +886,7 @@ class ExportedPythonArtifact:
             # Not [key, value] pairs: a hand-edit, treated like a dropped stamp.
             self._global_state = None
         self._code_devices = _code_devices(code)
+        self._check_cpu_isa(code)
         entry = self._load(code, from_disk=from_disk)
         self._example_inputs = None
         self._decompositions = None
